@@ -1,0 +1,2 @@
+variavel = input ('...')
+print (variavel)

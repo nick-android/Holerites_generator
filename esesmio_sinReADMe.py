@@ -66,77 +66,113 @@ def extract_text_from_pdf(pdf_file):
     return text
 
 def parse_funcionarios(text):
-    """Extrae empleados del PDF tipo 'Funcionários y Sueldos' usando ID, nombre, CI y salario."""
+    """Extrae datos de funcionarios de forma híbrida (en línea o apilados)."""
     funcionarios = []
-
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.lower().startswith('id') or 'nome' in line.lower() or 'salarios' in line.lower():
-            continue
-
-        match = re.match(r'^(\d+)\s+(.+?)(?:\s+(\d+))?\s+Gs\.?([\d\.,]+)$', line, re.IGNORECASE)
-        if not match:
-            continue
-
-        empleado_id = int(match.group(1))
-        nombre = match.group(2).strip()
-        ci = match.group(3).strip() if match.group(3) else ''
-        salario_str = match.group(4).replace('.', '').replace(',', '.')
-        salario = float(salario_str) if salario_str else 0.0
-
-        funcionarios.append({
-            'ID': empleado_id,
-            'NOMBRE Y APELLIDO': nombre,
-            'CI Nº': ci,
-            'SALARIO REAJUSTADO': salario
-        })
-
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    
+    for i, line in enumerate(lines):
+        if "PYG" in line:
+            # Limpiar fila para análisis de una sola línea
+            cleaned = line.replace('"', '').replace("'", '').strip()
+            # Actualizar regex para incluir commas en el formato de salario (3.850.000,00)
+            match_inline = re.search(r'(.+?)\s+(\d+(?:-\d+)?)\s+PYG\s+([\d.,]+)', cleaned, re.IGNORECASE)
+            
+            if match_inline:
+                nombre = match_inline.group(1).strip()
+                ci = match_inline.group(2).strip()
+                # Extraer salario: remover puntos de miles y convertir coma decimal a punto
+                salario_str = match_inline.group(3).replace('.', '').replace(',', '.')
+                salario = float(salario_str) if salario_str else 0
+                funcionarios.append({
+                    'NOMBRE Y APELLIDO': nombre,
+                    'CI Nº': ci,
+                    'SALARIO REAJUSTADO': salario
+                })
+            else:
+                # Fallback: Buscar hacia arriba si están en líneas separadas
+                try:
+                    salario_str = line.replace("PYG", "").strip().split(',')[0].replace('.', '').replace(',', '.')
+                    salario = float(salario_str)
+                    ci = lines[i-1].replace('"', '').replace(',', '').strip()
+                    nombre = lines[i-2].replace('"', '').replace(',', '').strip()
+                    
+                    if not re.search(r'\d', ci) and i >= 3:
+                        ci = lines[i-2].replace('"', '').replace(',', '').strip()
+                        nombre = lines[i-3].replace('"', '').replace(',', '').strip()
+                        
+                    if "FUNC" not in nombre.upper() and "FORA" not in nombre.upper():
+                        funcionarios.append({
+                            'NOMBRE Y APELLIDO': nombre,
+                            'CI Nº': ci,
+                            'SALARIO REAJUSTADO': salario
+                        })
+                except Exception:
+                    continue
+                    
     return pd.DataFrame(funcionarios)
 
-
 def parse_biometrico(text, df_funcionarios):
-    """Extrae marcaciones del PDF Book usando el ID del empleado para evitar confusiones de nombres."""
-    if df_funcionarios is None or 'ID' not in df_funcionarios.columns or df_funcionarios.empty:
+    """Agrupa las marcaciones usando límites estrictos para evitar solapamiento de nombres."""
+    # Si no hay datos válidos de funcionarios, no intentar parsear el biométrico
+    if df_funcionarios is None or 'NOMBRE Y APELLIDO' not in df_funcionarios.columns or df_funcionarios.empty:
         return pd.DataFrame()
 
-    id_lookup = {
-        int(row['ID']): row['NOMBRE Y APELLIDO']
-        for _, row in df_funcionarios[['ID', 'NOMBRE Y APELLIDO']].dropna().iterrows()
-        if pd.notna(row['ID'])
-    }
-
+    roster = df_funcionarios['NOMBRE Y APELLIDO'].tolist()
+    date_pattern = r'\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}'
+    
+    matches = list(re.finditer(date_pattern, text))
     marcaciones = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.lower().startswith('id') and 'nombre' in line.lower():
-            continue
-
-        match = re.match(r'^(\d+)\s+(.+?)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})\s+(\d+)$', line, re.IGNORECASE)
-        if not match:
-            continue
-
-        empleado_id = int(match.group(1))
-        contexto = match.group(2).lower()
-        fecha_str = f"{match.group(3)} {match.group(4)}"
-
+    
+    for idx, match in enumerate(matches):
+        fecha_str = match.group(0)
+        start_pos = match.start()
+        end_pos = match.end()
+        
+        # Límites estrictos para que no lea contexto del registro vecino
+        prev_bound = matches[idx-1].end() if idx > 0 else 0
+        next_bound = matches[idx+1].start() if idx < len(matches) - 1 else len(text)
+        
+        left_chunk = text[max(prev_bound, start_pos - 80):start_pos]
+        right_chunk = text[end_pos:min(next_bound, end_pos + 80)]
+        contexto = (left_chunk + " " + right_chunk).lower().replace('"', '').replace('\n', ' ')
+        
         cargo = "Funcionario"
         if "drywall" in contexto:
             cargo = "104-Montador DryWall"
         elif "steel" in contexto:
             cargo = "105-Montador Steel"
-
-        nombre = id_lookup.get(empleado_id, match.group(2).strip())
-        marcaciones.append({
-            'ID': empleado_id,
-            'Nomb.': nombre,
-            'Tiempo': pd.to_datetime(fecha_str, format='%d/%m/%Y %H:%M:%S'),
-            'Cargo': cargo
-        })
-
+            
+        mejor_nombre = None
+        max_score = 0
+        
+        for emp in roster:
+            parts = [p for p in emp.lower().split() if len(p) > 2]
+            score = 0
+            
+            # Prioridad a coincidencias combinadas de nombre + apellido
+            if len(parts) >= 2:
+                for i in range(len(parts)-1):
+                    if f"{parts[i]} {parts[i+1]}" in contexto:
+                        score += 5
+                        
+            for p in parts:
+                if p in contexto:
+                    score += 2
+                    
+            if "guillermo" in emp.lower() and "guilhermo" in contexto:
+                score += 4
+                
+            if score > max_score and score > 0:
+                max_score = score
+                mejor_nombre = emp
+                
+        if mejor_nombre:
+            marcaciones.append({
+                'Nomb.': mejor_nombre,
+                'Tiempo': pd.to_datetime(fecha_str, format='%d/%m/%Y %H:%M:%S'),
+                'Cargo': cargo
+            })
+            
     return pd.DataFrame(marcaciones)
 
 # ==========================================
@@ -217,14 +253,13 @@ def calcular_nomina(df_func, df_bio, fecha_inicio=None, fecha_fin=None):
     # Asegurar un mínimo de 1 día hábil para evitar división por cero
     dias_habiles_periodo = max(dias_habiles_periodo, 1)
     
-    dict_cargos = df_bio.groupby('ID')['Cargo'].first().to_dict()
+    dict_cargos = df_bio.groupby('Nomb.')['Cargo'].first().to_dict()
     
     # Filtrar biometría por el período seleccionado
     df_bio_periodo = df_bio[(df_bio['Tiempo'].dt.date >= fecha_inicio) & 
                              (df_bio['Tiempo'].dt.date <= fecha_fin)]
     
     for _, empleado in df_func.iterrows():
-        empleado_id = int(empleado['ID'])
         nombre = empleado['NOMBRE Y APELLIDO']
         salario_base = empleado['SALARIO REAJUSTADO']
         
@@ -238,10 +273,10 @@ def calcular_nomina(df_func, df_bio, fecha_inicio=None, fecha_fin=None):
             salario_proporcional = salario_base * (dias_habiles_periodo / WORKING_DAYS_MONTHLY)
             valor_minuto = salario_proporcional / (dias_habiles_periodo * 8 * 60)
 
-        cargo_final = dict_cargos.get(empleado_id, "Funcionario")
+        cargo_final = dict_cargos.get(nombre, "Funcionario")
 
         # Filtrar marcaciones del empleado solo para el período seleccionado
-        marcaciones_empleado = df_bio_periodo[df_bio_periodo['ID'] == empleado_id]
+        marcaciones_empleado = df_bio_periodo[df_bio_periodo['Nomb.'] == nombre]
         total_lateness, total_e50, total_e100 = 0, 0, 0
         total_absence_hours = 0
 
@@ -314,7 +349,6 @@ def calcular_nomina(df_func, df_bio, fecha_inicio=None, fecha_fin=None):
         
         resultados.append({
             'Funcionario': nombre,
-            'ID': empleado_id,
             'CI Nº': empleado['CI Nº'],
             'Cargo': cargo_final,
             'Salario Base': salario_base,
@@ -578,3 +612,4 @@ if 'resultados' in st.session_state and not st.session_state['resultados'].empty
         mime="application/zip",
         type="primary"
     )
+    
