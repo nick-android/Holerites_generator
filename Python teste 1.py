@@ -1,2 +1,0 @@
-variavel = input ('...')
-print (variavel)
