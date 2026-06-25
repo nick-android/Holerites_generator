@@ -25,8 +25,8 @@ st.markdown(
 # ==========================================
 # CONSTANTES LABORALES
 # ==========================================
-MINUTOS_JORNADA = 8 * 60
-DIAS_MES        = 30
+MINUTOS_JORNADA = 8 * 60   # 480 min
+DIAS_MES        = 30       # divisor fijo
 TASA_IPS        = 0.09
 TOLERANCIA_MIN  = 5
 
@@ -51,171 +51,107 @@ def calcular_dias_habiles(fecha_inicio, fecha_fin, feriados=None):
                                holidays=holidays))
 
 
-# ==========================================
-# EXTRACCIÓN DE TEXTO
-# Devuelve UN TOKEN POR LÍNEA.
-# Maneja dos casos:
-#   A) PDF de texto plano: cada fila ya viene en línea separada
-#   B) PDF de tabla colapsada: "111 Ignacio Venialgo 5083111 Gs.7.000.000"
-#      → se expande a un token por línea
-# ==========================================
 def extract_text_from_pdf(pdf_file):
-    raw_lines = []
+    text = ""
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
             t = page.extract_text()
             if t:
-                for line in t.split("\n"):
-                    line = line.strip()
-                    if line:
-                        raw_lines.append(line)
-
-    # Expandir líneas que contienen un salario embebido
-    # Ej: "111 Ignacio Venialgo Figueredo 5083111 Gs.7.000.000"
-    # → ["111", "Ignacio Venialgo Figueredo", "5083111", "Gs.7.000.000"]
-    salary_inline = re.compile(
-        r'^(\d+)\s+(.+?)\s+(\d{6,12})\s+(Gs\.[\d.]+)\s*$', re.IGNORECASE)
-    salary_inline_noci = re.compile(
-        r'^(\d+)\s+(.+?)\s+(Gs\.[\d.]+)\s*$', re.IGNORECASE)
-
-    # Patrón para detectar línea biométrica colapsada:
-    # "26 luis alberto montador steel 01/06/2026 07:05:00 1"
-    bio_inline = re.compile(
-        r'^(\d+)\s+(.+?)\s+(montador\s+\w+|administrativo)\s+'
-        r'(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})\s+\d+\s*$',
-        re.IGNORECASE)
-
-    tokens = []
-    for line in raw_lines:
-        # Intentar expandir línea de funcionario con CI
-        m = salary_inline.match(line)
-        if m:
-            tokens.append(m.group(1))        # ID
-            tokens.append(m.group(2).strip()) # Nombre
-            tokens.append(m.group(3))        # CI
-            tokens.append(m.group(4))        # Gs.X
-            continue
-
-        # Intentar expandir línea de funcionario sin CI
-        m2 = salary_inline_noci.match(line)
-        if m2:
-            tokens.append(m2.group(1))        # ID
-            tokens.append(m2.group(2).strip()) # Nombre
-            tokens.append(m2.group(3))        # Gs.X
-            continue
-
-        # Intentar expandir línea biométrica
-        m3 = bio_inline.match(line)
-        if m3:
-            tokens.append(f"{m3.group(1)} {m3.group(2).strip()}")  # "ID nombre"
-            tokens.append(m3.group(3).strip())                      # depto
-            tokens.append(m3.group(4).strip())                      # timestamp
-            tokens.append("1")                                       # dispositivo
-            continue
-
-        # Línea normal: agregar tal cual
-        tokens.append(line)
-
-    return "\n".join(tokens)
+                text += t + "\n"
+    return text
 
 
 # ==========================================
 # PARSER — FUNCIONARIOS Y SUELDOS
-#
-# Después de extract_text_from_pdf, el texto queda
-# normalizado a un token por línea:
-#
-#   111
-#   Ignacio Venialgo Figueredo
-#   5083111
-#   Gs.7.000.000   ← ancla
-#   105
-#   Ricardo Perelló
-#   Gs.11.000.000  ← ancla (sin CI)
+# Formato real:
+#   [ID corto]
+#   [Nombre completo]
+#   [CI  — puede estar ausente]
+#   Gs.[monto]
 # ==========================================
 def parse_funcionarios(text):
     lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-    HEADERS = {
+    # Encabezados a ignorar
+    SKIP = {
         "id.", "nome", "c.i.", "salarios", "id", "nombre", "ci",
         "nombre y apellido", "funcionarios y sueldos",
-        "funcionários y sueldos", "salario", "depart.",
-        "tiempo", "id del dispositivo"
+        "funcionários y sueldos", "salário", "salario",
     }
 
-    salary_pat = re.compile(r'^[Gg][Ss]\.?\s*([\d.]+)$')
-    int_pat    = re.compile(r'^\d+$')
+    salary_pat = re.compile(r"^Gs\.([\d.]+)$", re.IGNORECASE)
+    # CI: número de 6-12 dígitos que termina con los últimos 2-3 dígitos del ID
+    ci_pat     = re.compile(r"^\d{6,12}$")
+    id_pat     = re.compile(r"^\d{1,4}$")   # IDs de 1 a 4 dígitos
+    name_pat   = re.compile(r"^[A-Za-záéíóúÁÉÍÓÚñÑüÜ ]+$")
 
     funcionarios = []
-    seen_ids     = set()
+    seen_ids = set()
 
-    for idx, line in enumerate(lines):
+    for i, line in enumerate(lines):
         m = salary_pat.match(line)
         if not m:
             continue
 
-        raw = m.group(1).replace(".", "")
-        try:
-            salary = float(raw)
-        except ValueError:
-            continue
-        if salary < 500_000:
-            continue
+        salary = float(m.group(1).replace(".", ""))
 
-        # Recolectar hasta 6 líneas previas ignorando headers
-        preceding = []
-        j = idx - 1
-        while j >= 0 and len(preceding) < 6:
+        # Recopilar hasta 4 líneas anteriores
+        prev = []
+        for j in range(i - 1, max(i - 5, -1), -1):
             c = lines[j].strip()
-            if c and c.lower() not in HEADERS:
-                preceding.insert(0, c)
-            j -= 1
+            if c.lower() in SKIP:
+                continue
+            prev.insert(0, c)
+            if len(prev) == 4:
+                break
 
-        if not preceding:
+        if not prev:
             continue
 
         emp_id = None
         ci     = ""
+        nombre = ""
 
-        # ¿El último token es una CI? (número puro, 6-12 dígitos, ≥ 100.000)
-        last = preceding[-1]
-        if (int_pat.match(last)
-                and 6 <= len(last) <= 12
-                and int(last) >= 100_000):
-            ci        = last
-            remaining = preceding[:-1]
-        else:
-            remaining = preceding[:]
+        # Estrategia: buscar de atrás hacia adelante
+        # Patrón esperado (de más cercano al salario al más lejano):
+        #   [CI o nada]  ←  línea justo antes del salario
+        #   [Nombre]
+        #   [ID]
 
-        if not remaining:
-            continue
+        # Detectar CI en la primera línea previa
+        idx = 0
+        if ci_pat.match(prev[-1 - idx] if len(prev) > idx else ""):
+            ci  = prev[-1 - idx]
+            idx += 1
 
-        # Buscar ID (número pequeño ≤ 5 dígitos) de derecha a izquierda
+        # Líneas restantes: nombre + ID
+        resto = prev[:len(prev) - idx] if idx > 0 else prev[:]
+
+        # El ID es el primer elemento si es un número corto
         name_parts = []
-        found_id   = False
-        for k in range(len(remaining) - 1, -1, -1):
-            tok = remaining[k]
-            if int_pat.match(tok) and int(tok) < 100_000 and len(tok) <= 5:
-                emp_id     = int(tok)
-                name_parts = remaining[k + 1:]
-                found_id   = True
-                break
+        for k, tok in enumerate(resto):
+            if id_pat.match(tok) and k == 0:
+                emp_id = int(tok)
             else:
-                name_parts.insert(0, tok)
-
-        if not found_id:
-            continue
+                name_parts.append(tok)
 
         nombre = " ".join(name_parts).strip()
-        if not nombre:
-            continue
 
-        if emp_id not in seen_ids:
+        # Fallback: si no encontramos ID todavía, buscarlo en cualquier posición
+        if emp_id is None:
+            for tok in prev:
+                if id_pat.match(tok):
+                    candidate = int(tok)
+                    if candidate not in seen_ids:
+                        emp_id = candidate
+                        break
+
+        if emp_id is not None and nombre and emp_id not in seen_ids:
             seen_ids.add(emp_id)
             funcionarios.append({
-                "ID":                 emp_id,
-                "NOMBRE Y APELLIDO":  nombre,
-                "CI Nº":              ci,
+                "ID":                emp_id,
+                "NOMBRE Y APELLIDO": nombre,
+                "CI Nº":             ci,
                 "SALARIO REAJUSTADO": salary,
             })
 
@@ -224,65 +160,100 @@ def parse_funcionarios(text):
 
 # ==========================================
 # PARSER — BOOK (BIOMÉTRICO)
+# Formato real por registro (4 líneas):
+#   [ID] [nombre parcial]      ← ej: "26 luis alberto"
+#   [departamento]             ← ej: "montador steel"
+#   [DD/MM/YYYY HH:MM:SS]
+#   [ID dispositivo]           ← número suelto, ignorar
 #
-# Después de extract_text_from_pdf, el texto queda:
-#
-#   26 luis alberto        ← "ID nombre_parcial"
-#   montador steel         ← departamento
-#   01/06/2026 07:05:00    ← timestamp  ← ANCLA
-#   1                      ← dispositivo
+# El match con funcionarios se hace por ID numérico,
+# no por nombre (los nombres están abreviados en el Book).
 # ==========================================
 def parse_biometrico(text, df_funcionarios):
     if df_funcionarios is None or df_funcionarios.empty:
         return pd.DataFrame()
 
+    # Mapa ID → nombre completo
     id_to_nombre = dict(zip(
-        df_funcionarios["ID"],
+        df_funcionarios["ID"].astype(int),
         df_funcionarios["NOMBRE Y APELLIDO"]
     ))
 
     lines = [l.strip() for l in text.split("\n") if l.strip()]
 
+    # Encabezados a saltear
     SKIP_H = {
         "id.", "nombre", "depart.", "tiempo", "id del dispositivo",
-        "book", "reporte", "fecha", "hora", "1", "id",
-        "departamento", "nome", "c.i.", "salarios", "salario",
-        "funcionarios y sueldos", "funcionários y sueldos"
+        "book", "reporte", "fecha", "hora",
     }
-    clean = [l for l in lines if l.lower() not in SKIP_H]
 
-    ts_pat      = re.compile(r'^\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}$')
-    id_name_pat = re.compile(r'^(\d+)\s+(.+)$')
+    ts_pat     = re.compile(r"^\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}$")
+    id_line_pat = re.compile(r"^(\d{1,4})\s+(.+)$")
+    dev_id_pat  = re.compile(r"^\d{1,3}$")   # ID dispositivo: 1-3 dígitos solos
 
     marcaciones = []
 
-    for i, line in enumerate(clean):
+    for i, line in enumerate(lines):
+        # Buscar timestamps
         if not ts_pat.match(line):
             continue
+
         try:
             fecha_hora = pd.to_datetime(line, format="%d/%m/%Y %H:%M:%S")
         except Exception:
             continue
 
-        dept_line = clean[i - 1].lower() if i >= 1 else ""
-        name_line = clean[i - 2]         if i >= 2 else ""
+        # La línea anterior al timestamp es el departamento
+        # La línea anterior al departamento es "[ID] [nombre]"
+        # (saltear encabezados y líneas de ID de dispositivo)
 
-        if   "drywall" in dept_line: cargo = "Montador DryWall"
-        elif "steel"   in dept_line: cargo = "Montador Steel Frame"
-        elif "admin"   in dept_line: cargo = "Administrativo"
-        else:                        cargo = "Funcionario"
+        dept_line   = ""
+        id_name_line = ""
 
-        m = id_name_pat.match(name_line)
+        # Buscar hacia atrás saltando encabezados y IDs de dispositivo
+        j = i - 1
+        while j >= 0:
+            c = lines[j].strip()
+            if c.lower() in SKIP_H:
+                j -= 1
+                continue
+            if not dept_line:
+                # Primera línea válida antes del timestamp = departamento
+                dept_line = c.lower()
+                j -= 1
+                continue
+            if not id_name_line:
+                # Segunda línea válida = "[ID] [nombre]" o ID dispositivo anterior
+                # Si es solo un número corto (dispositivo del registro anterior),
+                # saltarlo y seguir buscando
+                if dev_id_pat.match(c):
+                    j -= 1
+                    continue
+                id_name_line = c
+                break
+            break
+
+        if not id_name_line:
+            continue
+
+        # Detectar cargo
+        if   "drywall" in dept_line:  cargo = "Montador DryWall"
+        elif "steel"   in dept_line:  cargo = "Montador Steel Frame"
+        elif "admin"   in dept_line:  cargo = "Administrativo"
+        else:                         cargo = "Funcionario"
+
+        # Extraer ID del empleado
+        m = id_line_pat.match(id_name_line)
         if not m:
             continue
 
-        cid = int(m.group(1))
-        if cid not in id_to_nombre:
+        emp_id = int(m.group(1))
+        if emp_id not in id_to_nombre:
             continue
 
         marcaciones.append({
-            "ID":     cid,
-            "Nomb.":  id_to_nombre[cid],
+            "ID":     emp_id,
+            "Nomb.":  id_to_nombre[emp_id],
             "Tiempo": fecha_hora,
             "Cargo":  cargo,
         })
@@ -291,9 +262,11 @@ def parse_biometrico(text, df_funcionarios):
 
 
 # ==========================================
-# HELPER — MINUTOS NOCTURNOS (22:00–06:00)
+# HELPER — MINUTOS NOCTURNOS
+# Horario nocturno: 22:00–06:00
 # ==========================================
-def _minutos_nocturnos(entrada: pd.Timestamp, salida: pd.Timestamp) -> int:
+def _minutos_nocturnos(entrada: pd.Timestamp,
+                        salida:  pd.Timestamp) -> int:
     if salida <= entrada:
         return 0
     total = 0
@@ -339,20 +312,25 @@ def clasificar_minutos(marcaciones_dia, weekday, es_feriado=False):
     bonus100_min = 0
 
     if es_feriado or weekday == 6:
+        # Feriado / domingo: base ya en sal_prop → solo bonus 100%
         bonus100_min = total_min
 
     elif weekday == 5:
+        # Sábado: base ya en sal_prop → bonus según horario
         for (entrada, salida) in pairs:
-            mediodia = entrada.replace(hour=12, minute=0,
-                                       second=0, microsecond=0)
+            mediodia = entrada.replace(
+                hour=12, minute=0, second=0, microsecond=0)
             ov_e = min(salida, mediodia)
             if ov_e > entrada:
-                bonus50_min += int((ov_e - entrada).total_seconds() / 60)
+                bonus50_min += int(
+                    (ov_e - entrada).total_seconds() / 60)
             ov_s = max(entrada, mediodia)
             if salida > ov_s:
-                bonus100_min += int((salida - ov_s).total_seconds() / 60)
+                bonus100_min += int(
+                    (salida - ov_s).total_seconds() / 60)
 
     else:
+        # Lunes–Viernes
         if total_min < MINUTOS_JORNADA:
             diff = MINUTOS_JORNADA - total_min
             atraso_min = 0 if diff < TOLERANCIA_MIN else diff
@@ -365,16 +343,24 @@ def clasificar_minutos(marcaciones_dia, weekday, es_feriado=False):
                 par_dur     = int((salida - entrada).total_seconds() / 60)
                 ot_este_par = min(rem_ot, par_dur)
                 ot_desde    = salida - pd.Timedelta(minutes=ot_este_par)
-                noc = min(_minutos_nocturnos(ot_desde, salida), ot_este_par)
+                noc = min(
+                    _minutos_nocturnos(ot_desde, salida), ot_este_par)
                 ot_noche_min += noc
                 ot_dia_min   += ot_este_par - noc
                 rem_ot -= ot_este_par
 
-    return total_min, atraso_min, ot_dia_min, ot_noche_min, bonus50_min, bonus100_min
+    return (total_min, atraso_min,
+            ot_dia_min, ot_noche_min,
+            bonus50_min, bonus100_min)
 
 
 # ==========================================
 # CÁLCULO DE NÓMINA
+# val_dia    = salario / 30
+# val_minuto = val_dia / 480
+# sal_prop   = salario × días_calendario / 30
+# OT neta    = +0.5 diurna, +1.0 nocturna  (base ya en sal_prop)
+# Bonus      = +0.5 sáb mañana, +1.0 sáb tarde/dom/feriado
 # ==========================================
 def calcular_nomina(df_func, df_bio, fecha_inicio, fecha_fin,
                     periodo_tipo, feriados=None):
@@ -413,7 +399,8 @@ def calcular_nomina(df_func, df_bio, fecha_inicio, fecha_fin,
         if periodo_tipo == "Semanal":
             sal_prop = round(salario_base * 7 / DIAS_MES)
         else:
-            sal_prop = round(salario_base * dias_calendario / DIAS_MES)
+            sal_prop = round(
+                salario_base * dias_calendario / DIAS_MES)
 
         marcs_emp = df_bio_p[df_bio_p["Nomb."] == nombre]
 
@@ -434,8 +421,9 @@ def calcular_nomina(df_func, df_bio, fecha_inicio, fecha_fin,
                 es_feriado = fecha in feriados_set
                 wd = pd.Timestamp(fecha).weekday()
 
-                total_min, atraso, ot_dia, ot_noche, b50, b100 = \
-                    clasificar_minutos(punches_dia, wd, es_feriado)
+                (total_min, atraso, ot_dia,
+                 ot_noche, b50, b100) = clasificar_minutos(
+                    punches_dia, wd, es_feriado)
 
                 if es_feriado and total_min > 0:
                     feriados_trabajados += 1
@@ -449,12 +437,14 @@ def calcular_nomina(df_func, df_bio, fecha_inicio, fecha_fin,
                 if wd < 5 and not es_feriado:
                     dias_hab_trabajados[fecha] = True
 
+        # Ausencias por semana
         total_dias_ausentes  = 0
         total_dias_descuento = 0
 
         semana_ini = (
             pd.Timestamp(fecha_inicio)
-            - pd.Timedelta(days=pd.Timestamp(fecha_inicio).weekday())
+            - pd.Timedelta(
+                days=pd.Timestamp(fecha_inicio).weekday())
         )
 
         while semana_ini.date() <= fecha_fin:
@@ -472,8 +462,8 @@ def calcular_nomina(df_func, df_bio, fecha_inicio, fecha_fin,
                     dias_trabajados += 1
 
             dias_faltados = max(0, dias_esperados - dias_trabajados)
-            dias_desc     = ABSENCE_DEDUCTION_DAYS.get(
-                                min(dias_faltados, 5), 7)
+            dias_desc = ABSENCE_DEDUCTION_DAYS.get(
+                min(dias_faltados, 5), 7)
             total_dias_ausentes  += dias_faltados
             total_dias_descuento += dias_desc
             semana_ini += pd.Timedelta(days=7)
@@ -487,12 +477,9 @@ def calcular_nomina(df_func, df_bio, fecha_inicio, fecha_fin,
 
         imponible = max(0, round(
             sal_prop
-            - desc_ausencias
-            - desc_atrasos
-            + monto_ot_dia
-            + monto_ot_noche
-            + monto_bonus50
-            + monto_bonus100
+            - desc_ausencias - desc_atrasos
+            + monto_ot_dia   + monto_ot_noche
+            + monto_bonus50  + monto_bonus100
         ))
         ips     = round(imponible * TASA_IPS)
         liquido = max(0, imponible - ips)
@@ -556,9 +543,9 @@ class PDFHolerite(FPDF):
                            f"al {ff.strftime('%d/%m/%Y')}")
         else:
             now = datetime.datetime.now()
-            meses = ["","enero","febrero","marzo","abril","mayo","junio",
-                     "julio","agosto","septiembre","octubre",
-                     "noviembre","diciembre"]
+            meses = ["","enero","febrero","marzo","abril","mayo",
+                     "junio","julio","agosto","septiembre",
+                     "octubre","noviembre","diciembre"]
             periodo_str = f"{meses[now.month]}/{now.year}"
 
         tipo_txt = ("COMPROVANTE EMPRESA" if es_empresa
@@ -568,7 +555,8 @@ class PDFHolerite(FPDF):
         self.set_font("Helvetica", "B", 9)
         self.cell(RW / 2, 5, "Empresa", 0, 0, "L")
         self.cell(RW / 2, 5,
-                  f"RECIBO DE PAGO DE SALÁRIO — {tipo_txt}", 0, 1, "R")
+                  f"RECIBO DE PAGO DE SALÁRIO — {tipo_txt}",
+                  0, 1, "R")
         self.set_xy(L, 9 + oy)
         self.set_font("Helvetica", "B", 11)
         self.cell(RW / 2, 5, "WIEGAND BRITO", 0, 0, "L")
@@ -612,11 +600,16 @@ class PDFHolerite(FPDF):
             bg = (245, 245, 245) if alt else (255, 255, 255)
             self.set_fill_color(*bg)
             self.set_font("Helvetica", "", 7)
-            self.cell(C_COD,   ROW_H, str(cod),            1, 0, "C", True)
-            self.cell(C_DESC,  ROW_H, f" {desc}",          1, 0, "L", True)
-            self.cell(C_REF,   ROW_H, str(ref),            1, 0, "C", True)
-            self.cell(C_REC,   ROW_H, format_gs(recibir),  1, 0, "R", True)
-            self.cell(C_DESC2, ROW_H, format_gs(descuento),1, 1, "R", True)
+            self.cell(C_COD,   ROW_H, str(cod),
+                      1, 0, "C", True)
+            self.cell(C_DESC,  ROW_H, f" {desc}",
+                      1, 0, "L", True)
+            self.cell(C_REF,   ROW_H, str(ref),
+                      1, 0, "C", True)
+            self.cell(C_REC,   ROW_H, format_gs(recibir),
+                      1, 0, "R", True)
+            self.cell(C_DESC2, ROW_H, format_gs(descuento),
+                      1, 1, "R", True)
             alt = not alt
 
         dias_cal = data.get("Días Calendario", 30)
@@ -670,14 +663,17 @@ class PDFHolerite(FPDF):
         self.cell(C_COD + C_DESC + C_REF, ROW_H,
                   "SALARIO LÍQUIDO →", 1, 0, "R", True)
         self.cell(C_REC + C_DESC2, ROW_H,
-                  format_gs(data["Salario Líquido"]), 1, 1, "R", True)
+                  format_gs(data["Salario Líquido"]),
+                  1, 1, "R", True)
 
         y_obs = self.get_y() + 3
         self.set_xy(L, y_obs)
         self.set_font("Helvetica", "B", 7)
-        self.cell(RW, 4, "OBS: PAGO EFECTUADO EN LA CUENTA DE:", 0, 1)
+        self.cell(RW, 4,
+                  "OBS: PAGO EFECTUADO EN LA CUENTA DE:", 0, 1)
         self.set_font("Helvetica", "", 8)
-        self.cell(RW, 4, str(data["Funcionario"]).upper(), 0, 1)
+        self.cell(RW, 4,
+                  str(data["Funcionario"]).upper(), 0, 1)
         self.cell(RW, 4, f"CI: {data['CI Nº']}", 0, 1)
 
         y_f = self.get_y() + 5
@@ -685,9 +681,11 @@ class PDFHolerite(FPDF):
         self.set_font("Helvetica", "", 7)
         self.cell(40, 5, "FECHA: _____/_____/_______", 0, 0)
         self.cell(5,  5, "", 0, 0)
-        self.cell(65, 5, "FIRMA EMPRESA: _______________________", 0, 0)
+        self.cell(65, 5,
+                  "FIRMA EMPRESA: _______________________", 0, 0)
         self.cell(5,  5, "", 0, 0)
-        self.cell(60, 5, "FIRMA FUNC.: ________________________", 0, 1)
+        self.cell(60, 5,
+                  "FIRMA FUNC.: ________________________", 0, 1)
 
     def generar(self, data: dict):
         self.add_page()
@@ -733,11 +731,11 @@ def generar_zip(df: pd.DataFrame) -> bytes:
 
 
 # ==========================================
-# COMPONENTE: CALENDARIO INTERACTIVO DE FERIADOS
+# CALENDARIO INTERACTIVO DE FERIADOS
 # ==========================================
 def calendario_feriados(fecha_inicio: datetime.date,
-                         fecha_fin: datetime.date,
-                         key_prefix: str = "cal") -> list:
+                         fecha_fin:    datetime.date,
+                         key_prefix:   str = "cal") -> list:
     if f"{key_prefix}_year" not in st.session_state:
         st.session_state[f"{key_prefix}_year"]  = fecha_inicio.year
     if f"{key_prefix}_month" not in st.session_state:
@@ -746,8 +744,8 @@ def calendario_feriados(fecha_inicio: datetime.date,
         st.session_state[f"{key_prefix}_selected"] = set()
 
     selected: set = st.session_state[f"{key_prefix}_selected"]
-    yr  = st.session_state[f"{key_prefix}_year"]
-    mo  = st.session_state[f"{key_prefix}_month"]
+    yr = st.session_state[f"{key_prefix}_year"]
+    mo = st.session_state[f"{key_prefix}_month"]
 
     nav1, nav2, nav3 = st.columns([1, 3, 1])
     with nav1:
@@ -759,14 +757,13 @@ def calendario_feriados(fecha_inicio: datetime.date,
                 st.session_state[f"{key_prefix}_month"] = mo - 1
             st.rerun()
     with nav2:
-        meses_es = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo",
-                    "Junio", "Julio", "Agosto", "Septiembre",
-                    "Octubre", "Noviembre", "Diciembre"]
+        meses_es = ["", "Enero", "Febrero", "Marzo", "Abril",
+                    "Mayo", "Junio", "Julio", "Agosto",
+                    "Septiembre", "Octubre", "Noviembre", "Diciembre"]
         st.markdown(
             f"<h4 style='text-align:center;margin:0'>"
             f"{meses_es[mo]} {yr}</h4>",
-            unsafe_allow_html=True
-        )
+            unsafe_allow_html=True)
     with nav3:
         if st.button("▶", key=f"{key_prefix}_next"):
             if mo == 12:
@@ -777,19 +774,18 @@ def calendario_feriados(fecha_inicio: datetime.date,
             st.rerun()
 
     dias_semana = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
-    header_cols = st.columns(7)
+    hcols = st.columns(7)
     for i, d in enumerate(dias_semana):
         color = "#cc0000" if i >= 5 else "#444444"
-        header_cols[i].markdown(
+        hcols[i].markdown(
             f"<div style='text-align:center;font-weight:bold;"
             f"color:{color};font-size:13px'>{d}</div>",
-            unsafe_allow_html=True
-        )
+            unsafe_allow_html=True)
 
     for semana in calendar.monthcalendar(yr, mo):
-        row_cols = st.columns(7)
+        rcols = st.columns(7)
         for i, dia_num in enumerate(semana):
-            with row_cols[i]:
+            with rcols[i]:
                 if dia_num == 0:
                     st.markdown(
                         "<div style='height:38px'></div>",
@@ -802,13 +798,12 @@ def calendario_feriados(fecha_inicio: datetime.date,
 
                 if not en_periodo:
                     st.markdown(
-                        f"<div style='text-align:center;padding:8px 0;"
-                        f"color:#bbbbbb;font-size:12px;"
-                        f"border:1px solid #eeeeee;"
+                        f"<div style='text-align:center;"
+                        f"padding:8px 0;color:#bbbbbb;"
+                        f"font-size:12px;border:1px solid #eee;"
                         f"border-radius:4px;background:#fafafa'>"
                         f"{dia_num}</div>",
-                        unsafe_allow_html=True
-                    )
+                        unsafe_allow_html=True)
                 else:
                     if es_selected:
                         label = f"🔴 {dia_num}"
@@ -817,7 +812,8 @@ def calendario_feriados(fecha_inicio: datetime.date,
                     else:
                         label = str(dia_num)
 
-                    if st.button(label, key=f"{key_prefix}_{fecha}"):
+                    if st.button(label,
+                                 key=f"{key_prefix}_{fecha}"):
                         if fecha in selected:
                             selected.discard(fecha)
                         else:
@@ -828,10 +824,9 @@ def calendario_feriados(fecha_inicio: datetime.date,
         "<div style='font-size:11px;color:#666;margin-top:6px'>"
         "🔴 Feriado marcado &nbsp;|&nbsp; "
         "🔵 Fin de semana &nbsp;|&nbsp; "
-        "Número sin color = día hábil del período"
+        "Número = día hábil del período"
         "</div>",
-        unsafe_allow_html=True
-    )
+        unsafe_allow_html=True)
 
     if selected:
         if st.button("🗑️ Limpiar todos los feriados",
@@ -875,30 +870,30 @@ with col_d2:
         "Fecha de fin", value=datetime.date(2026, 6, 30))
 
 if fecha_inicio > fecha_fin:
-    st.error("La fecha de inicio no puede ser posterior a la fecha de fin.")
+    st.error(
+        "La fecha de inicio no puede ser posterior a la fecha de fin.")
     st.stop()
 
 st.write("---")
 st.write("### 3. Feriados del Período")
 st.markdown(
     "Hacé clic en un día para marcarlo como feriado 🔴. "
-    "Los feriados **no generan ausencia** si el empleado no trabaja "
-    "(el día ya está pagado en el salario base). "
-    "Si trabaja en feriado, recibe **+100% de bonus** sobre el valor minuto."
+    "Los feriados **no generan ausencia** si el empleado no trabaja. "
+    "Si trabaja en feriado recibe **+100% de bonus**."
 )
 
 tab_cal, tab_lista = st.tabs(
     ["📅 Calendario interactivo", "⚡ Agregar por fecha"])
 
 with tab_cal:
-    feriados_calendario = calendario_feriados(
-        fecha_inicio, fecha_fin, key_prefix="cal")
+    calendario_feriados(fecha_inicio, fecha_fin, key_prefix="cal")
 
 with tab_lista:
     col_f1, col_f2 = st.columns([2, 1])
     with col_f1:
         feriado_nuevo = st.date_input(
-            "Agregar feriado", value=fecha_inicio, key="feriado_input")
+            "Agregar feriado",
+            value=fecha_inicio, key="feriado_input")
     with col_f2:
         st.write("")
         st.write("")
@@ -923,9 +918,12 @@ with tab_lista:
             st.session_state["cal_selected"].add(f)
         st.rerun()
 
-feriados_lista      = sorted(st.session_state.get("cal_selected", set()))
-feriados_en_periodo = [f for f in feriados_lista
-                        if fecha_inicio <= f <= fecha_fin]
+# Fuente única de verdad
+feriados_lista      = sorted(
+    st.session_state.get("cal_selected", set()))
+feriados_en_periodo = [
+    f for f in feriados_lista
+    if fecha_inicio <= f <= fecha_fin]
 
 if feriados_lista:
     st.markdown("**Feriados marcados:**")
@@ -937,8 +935,8 @@ if feriados_lista:
     if feriados_en_periodo:
         st.info(
             f"{len(feriados_en_periodo)} feriado(s) en el período: "
-            + ", ".join(f.strftime("%d/%m/%Y")
-                        for f in feriados_en_periodo))
+            + ", ".join(
+                f.strftime("%d/%m/%Y") for f in feriados_en_periodo))
     else:
         st.info("Ningún feriado marcado cae dentro del período.")
 else:
@@ -956,75 +954,67 @@ st.success(
     f"Tipo: **{periodo_tipo}**"
 )
 
-with st.expander("🔢 Verificar lógica de cálculo con ejemplo"):
+# Verificador numérico rápido
+with st.expander("🔢 Verificar lógica con ejemplo numérico"):
     sal_ej = st.number_input(
-        "Salario base de ejemplo (Gs.)",
-        min_value=0, value=2_500_000, step=100_000)
+        "Salario base (Gs.)",
+        min_value=0, value=3_850_000, step=100_000)
     if sal_ej > 0:
-        vd  = sal_ej / 30
-        vm  = vd / 480
-        sp  = sal_ej * dias_cal_prev / 30
+        vd = sal_ej / 30
+        vm = vd / 480
+        sp = sal_ej * dias_cal_prev / 30
         st.markdown(
-            f"- Valor día: **{format_gs(vd)}** (salario / 30)\n"
+            f"- Valor día: **{format_gs(vd)}**\n"
             f"- Valor minuto: **Gs. {vm:,.1f}**\n"
-            f"- Salario proporcional al período "
-            f"({dias_cal_prev} días): **{format_gs(sp)}**\n"
-            f"- Sábado/dom no trabajado: **Gs. 0** adicional\n"
-            f"- Sábado mañana trabajado (p.ej. 4h): "
+            f"- Sal. proporcional al período: **{format_gs(sp)}**\n"
+            f"- Sáb/dom no trabajado: **Gs. 0** adicional\n"
+            f"- Sáb mañana trabajado 4h: "
             f"**{format_gs(4*60*vm*0.5)}** de bonus\n"
-            f"- Domingo/feriado trabajado (p.ej. 8h): "
+            f"- Dom/feriado trabajado 8h: "
             f"**{format_gs(8*60*vm*1.0)}** de bonus\n"
-            f"- Ausencia 1 día hábil: descuento **{format_gs(vd)}**"
+            f"- Ausencia 1 día hábil: descuento "
+            f"**{format_gs(vd)}** (1 día × val_dia)\n"
+            f"- Ausencia 2 días hábiles: descuento "
+            f"**{format_gs(4*vd)}** (4 días × val_dia — penalidad)"
         )
 
 st.write("---")
-
-# ==========================================
-# PROCESAMIENTO
-# ==========================================
 if pdf_func and pdf_bio:
     if st.button("⚙️  Procesar y Calcular Nómina",
                  type="primary", use_container_width=True):
         with st.spinner("Procesando documentos..."):
             try:
-                text_func = extract_text_from_pdf(pdf_func)
-                text_bio  = extract_text_from_pdf(pdf_bio)
+                text1 = extract_text_from_pdf(pdf_func)
+                text2 = extract_text_from_pdf(pdf_bio)
 
-                # ── Diagnóstico (descomentar si hay problemas) ──
-                # with st.expander("🛠 RAW funcionarios"):
-                #     st.text(text_func[:4000])
-                # with st.expander("🛠 RAW book"):
-                #     st.text(text_bio[:4000])
+                df_f1 = parse_funcionarios(text1)
+                df_f2 = parse_funcionarios(text2)
 
-                df_f1 = parse_funcionarios(text_func)
-                df_f2 = parse_funcionarios(text_bio)
-
-                if not df_f1.empty and len(df_f1) >= len(df_f2):
+                # Detectar cuál PDF es cuál
+                if not df_f1.empty and df_f1["SALARIO REAJUSTADO"].max() > 1_000_000:
                     df_func_data = df_f1
-                    text_bio_use = text_bio
-                elif not df_f2.empty:
+                    text_bio     = text2
+                elif not df_f2.empty and df_f2["SALARIO REAJUSTADO"].max() > 1_000_000:
                     df_func_data = df_f2
-                    text_bio_use = text_func
+                    text_bio     = text1
                 else:
-                    st.error(
-                        "No se pudieron extraer datos de empleados. "
-                        "Descomentá las líneas de diagnóstico para ver "
-                        "el texto raw extraído del PDF.")
+                    st.error("No se pudieron extraer datos de empleados.")
                     st.stop()
 
                 with st.expander("🔍 Funcionarios detectados"):
                     st.dataframe(df_func_data, use_container_width=True)
 
-                df_bio_data = parse_biometrico(text_bio_use, df_func_data)
-
+                df_bio_data = parse_biometrico(text_bio, df_func_data)
                 if df_bio_data.empty:
                     st.error(
                         "No se detectaron marcaciones válidas en el Book.")
                     st.stop()
 
-                with st.expander("🔍 Marcaciones biométricas (primeras 60)"):
+                with st.expander(
+                        "🔍 Marcaciones biométricas (primeras 60)"):
                     st.dataframe(
-                        df_bio_data.head(60), use_container_width=True)
+                        df_bio_data.head(60),
+                        use_container_width=True)
 
                 df_res = calcular_nomina(
                     df_func_data, df_bio_data,
@@ -1032,18 +1022,17 @@ if pdf_func and pdf_bio:
                     periodo_tipo,
                     feriados=feriados_en_periodo,
                 )
-
                 if df_res.empty:
-                    st.error("No se generaron resultados de nómina.")
+                    st.error("No se generaron resultados.")
                     st.stop()
 
                 st.session_state["resultados"]      = df_res
                 st.session_state["feriados_usados"] = feriados_en_periodo
                 st.success(
-                    f"✅ Cálculo completado — {len(df_res)} funcionarios — "
+                    f"✅ Cálculo completado — "
+                    f"{len(df_res)} funcionarios — "
                     f"{len(feriados_en_periodo)} feriado(s) aplicado(s)."
                 )
-
             except Exception as e:
                 st.error(f"Error durante el procesamiento: {e}")
                 st.exception(e)
@@ -1081,8 +1070,8 @@ if ("resultados" in st.session_state
             "OT Diurna (min)", "OT Nocturna (min)",
             "Bonus Sáb Mañana (min)", "Bonus Descanso (min)",
             "Feriados Trabajados",
-            "Salario Proporcional", "Desc. Ausencias", "Desc. Atrasos",
-            "Monto OT Diurna", "Monto OT Nocturna",
+            "Salario Proporcional", "Desc. Ausencias",
+            "Desc. Atrasos", "Monto OT Diurna", "Monto OT Nocturna",
             "Monto Bonus Sáb Mañana", "Monto Bonus Descanso",
             "Total Imponible", "IPS (9%)", "Salario Líquido",
         ]],
