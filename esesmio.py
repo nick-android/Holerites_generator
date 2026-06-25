@@ -30,8 +30,6 @@ DIAS_MES        = 30       # divisor fijo: todos los días del mes están pagado
 TASA_IPS        = 0.09
 TOLERANCIA_MIN  = 5
 
-# Tabla de penalidad por ausencias semanales (ley PY)
-# clave = días faltados en la semana, valor = días a descontar
 ABSENCE_DEDUCTION_DAYS = {0: 0, 1: 1, 2: 4, 3: 5, 4: 6, 5: 7}
 
 # ==========================================
@@ -44,7 +42,6 @@ def format_gs(monto):
 
 
 def calcular_dias_habiles(fecha_inicio, fecha_fin, feriados=None):
-    """Días lunes-viernes excluyendo feriados. Solo se usa como referencia."""
     holidays = []
     if feriados:
         holidays = [np.datetime64(f, "D") for f in feriados]
@@ -54,27 +51,66 @@ def calcular_dias_habiles(fecha_inicio, fecha_fin, feriados=None):
                                holidays=holidays))
 
 
+# ==========================================
+# EXTRACCIÓN DE TEXTO — celda por celda
+# ==========================================
 def extract_text_from_pdf(pdf_file):
-    text = ""
+    """
+    Extrae el contenido del PDF celda por celda cuando hay tablas,
+    o línea por línea cuando es texto plano. Siempre devuelve un
+    string con un token por línea, que es lo que esperan los parsers.
+    """
+    lines = []
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                text += t + "\n"
-    return text
+            tables = page.extract_tables()
+            if tables:
+                for table in tables:
+                    for row in table:
+                        for cell in row:
+                            val = str(cell).strip() if cell is not None else ""
+                            if val and val.lower() != "none":
+                                lines.append(val)
+            else:
+                t = page.extract_text()
+                if t:
+                    for line in t.split("\n"):
+                        line = line.strip()
+                        if line:
+                            lines.append(line)
+    return "\n".join(lines)
 
 
 # ==========================================
 # PARSER — FUNCIONARIOS Y SUELDOS
+#
+# Formato real del PDF (una celda por línea tras extract_text_from_pdf):
+#   ID.
+#   Nome
+#   C.I.
+#   Salarios
+#   111
+#   Ignacio Venialgo Figueredo
+#   5083111
+#   Gs.7.000.000
+#   ...
+#
+# Estrategia: buscar patrón "Gs.X.XXX.XXX", luego mirar
+# las 3 líneas anteriores → [ID, Nombre, CI]
 # ==========================================
 def parse_funcionarios(text):
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    SKIP = {
+
+    HEADERS = {
         "id.", "nome", "c.i.", "salarios", "id", "nombre", "ci",
-        "nombre y apellido", "funcionarios y sueldos", "funcionários y sueldos"
+        "nombre y apellido", "funcionarios y sueldos",
+        "funcionários y sueldos", "salario"
     }
-    salary_pat = re.compile(r"^Gs\.\s*([\d.]+)$", re.IGNORECASE)
+
+    # Patrón Gs.7.000.000 o Gs. 7.000.000
+    salary_pat = re.compile(r"^Gs\.?\s*([\d.]+)$", re.IGNORECASE)
     int_pat    = re.compile(r"^\d+$")
+
     funcionarios = []
     seen_ids = set()
 
@@ -82,59 +118,111 @@ def parse_funcionarios(text):
         m = salary_pat.match(line)
         if not m:
             continue
-        salary = float(m.group(1).replace(".", ""))
+
+        salary_str = m.group(1).replace(".", "")
+        try:
+            salary = float(salary_str)
+        except ValueError:
+            continue
+
+        # Recolectar hasta 5 líneas anteriores ignorando headers
         preceding = []
         j = i - 1
-        while j >= 0 and len(preceding) < 4:
+        while j >= 0 and len(preceding) < 5:
             c = lines[j].strip()
-            if c.lower() not in SKIP and c:
+            if c and c.lower() not in HEADERS:
                 preceding.insert(0, c)
             j -= 1
+
         if not preceding:
             continue
-        emp_id = None
-        ci = ""
+
+        # El orden esperado hacia atrás desde el salario es:
+        #   CI  ←  Nombre  ←  ID
+        # pero CI puede faltar (ej. Ricardo Perelló no tiene CI)
+
+        emp_id    = None
+        ci        = ""
+        nombre    = ""
+
+        # ¿El último token es una CI (número > 5 dígitos)?
         if int_pat.match(preceding[-1]) and len(preceding[-1]) > 5:
             ci        = preceding[-1]
             remaining = preceding[:-1]
         else:
             remaining = preceding[:]
+
         if not remaining:
             continue
+
+        # Recorrer de derecha a izquierda buscando el ID (número pequeño)
         name_parts = []
         for k in range(len(remaining) - 1, -1, -1):
             tok = remaining[k]
-            if int_pat.match(tok) and int(tok) < 10000:
+            if int_pat.match(tok) and int(tok) < 100000:
                 emp_id = int(tok)
+                name_parts = remaining[k + 1:]
                 break
             else:
                 name_parts.insert(0, tok)
+
         nombre = " ".join(name_parts).strip()
+
         if emp_id is not None and nombre and emp_id not in seen_ids:
             seen_ids.add(emp_id)
             funcionarios.append({
-                "ID": emp_id,
+                "ID":                emp_id,
                 "NOMBRE Y APELLIDO": nombre,
-                "CI Nº": ci,
+                "CI Nº":             ci,
                 "SALARIO REAJUSTADO": salary,
             })
+
     return pd.DataFrame(funcionarios)
 
 
 # ==========================================
 # PARSER — BOOK (BIOMÉTRICO)
+#
+# Formato real del PDF (una celda por línea):
+#   26 luis alberto
+#   montador steel
+#   01/06/2026 07:05:00
+#   1
+#   270 roberto venialgo
+#   montador steel
+#   01/06/2026 07:22:48
+#   1
+#   ...
+#
+# Estrategia: buscar líneas con timestamp "DD/MM/YYYY HH:MM:SS",
+# luego mirar i-1 → departamento, i-2 → "ID nombre".
+# El ID se cruza contra el dict de funcionarios para obtener
+# el nombre completo.
 # ==========================================
 def parse_biometrico(text, df_funcionarios):
     if df_funcionarios is None or df_funcionarios.empty:
         return pd.DataFrame()
-    id_to_nombre = dict(zip(df_funcionarios["ID"],
-                            df_funcionarios["NOMBRE Y APELLIDO"]))
-    lines  = [l.strip() for l in text.split("\n") if l.strip()]
-    SKIP_H = {"id.", "nombre", "depart.", "tiempo", "id del dispositivo",
-               "book", "reporte", "fecha", "hora"}
-    clean  = [l for l in lines if l.lower() not in SKIP_H]
+
+    # Mapa ID → nombre completo (desde la planilla de sueldos)
+    id_to_nombre = dict(zip(
+        df_funcionarios["ID"],
+        df_funcionarios["NOMBRE Y APELLIDO"]
+    ))
+
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+    # Headers a ignorar (aparecen al inicio de cada página)
+    SKIP_H = {
+        "id.", "nombre", "depart.", "tiempo", "id del dispositivo",
+        "book", "reporte", "fecha", "hora", "1", "id",
+        "departamento", "depart"
+    }
+    clean = [l for l in lines if l.lower() not in SKIP_H]
+
     ts_pat      = re.compile(r"^\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}$")
+    # "26 luis alberto" — ID seguido de nombre parcial
     id_name_pat = re.compile(r"^(\d+)\s+(.+)$")
+
     marcaciones = []
 
     for i, line in enumerate(clean):
@@ -144,30 +232,36 @@ def parse_biometrico(text, df_funcionarios):
             fecha_hora = pd.to_datetime(line, format="%d/%m/%Y %H:%M:%S")
         except Exception:
             continue
+
         dept_line = clean[i - 1].lower() if i >= 1 else ""
-        name_line = clean[i - 2]          if i >= 2 else ""
-        if   "drywall" in dept_line: cargo = "Montador DryWall"
-        elif "steel"   in dept_line: cargo = "Montador Steel Frame"
-        elif "admin"   in dept_line: cargo = "Administrativo"
-        else:                        cargo = "Funcionario"
+        name_line = clean[i - 2]         if i >= 2 else ""
+
+        # Determinar cargo según departamento
+        if   "drywall"      in dept_line: cargo = "Montador DryWall"
+        elif "steel"        in dept_line: cargo = "Montador Steel Frame"
+        elif "admin"        in dept_line: cargo = "Administrativo"
+        else:                             cargo = "Funcionario"
+
         m = id_name_pat.match(name_line)
         if not m:
             continue
+
         cid = int(m.group(1))
         if cid not in id_to_nombre:
             continue
+
         marcaciones.append({
-            "ID": cid,
-            "Nomb.": id_to_nombre[cid],
+            "ID":     cid,
+            "Nomb.":  id_to_nombre[cid],
             "Tiempo": fecha_hora,
-            "Cargo": cargo,
+            "Cargo":  cargo,
         })
+
     return pd.DataFrame(marcaciones)
 
 
 # ==========================================
 # HELPER — MINUTOS NOCTURNOS
-# Horario nocturno: 22:00–06:00
 # ==========================================
 def _minutos_nocturnos(entrada: pd.Timestamp, salida: pd.Timestamp) -> int:
     if salida <= entrada:
@@ -176,12 +270,10 @@ def _minutos_nocturnos(entrada: pd.Timestamp, salida: pd.Timestamp) -> int:
     dia = entrada.normalize()
     while dia < salida:
         sig = dia + pd.Timedelta(days=1)
-        # Madrugada [00:00, 06:00)
         ov_s = max(entrada, dia)
         ov_e = min(salida,  dia + pd.Timedelta(hours=6))
         if ov_e > ov_s:
             total += int((ov_e - ov_s).total_seconds() / 60)
-        # Noche tardía [22:00, 24:00)
         ov_s = max(entrada, dia + pd.Timedelta(hours=22))
         ov_e = min(salida,  sig)
         if ov_e > ov_s:
@@ -192,26 +284,6 @@ def _minutos_nocturnos(entrada: pd.Timestamp, salida: pd.Timestamp) -> int:
 
 # ==========================================
 # CLASIFICACIÓN DE MINUTOS POR DÍA
-#
-# Con divisor 30, TODOS los días (incluyendo sáb/dom/feriados)
-# ya están pagados en el salario base. Por eso:
-#
-#   Lun-Vie normal:
-#     - Trabaja menos de 8h  → descuento por atraso (minutos faltantes)
-#     - Trabaja más de 8h    → OT diurna × 1.5 o nocturna × 2.0
-#                              (base ya está en sal_prop, se paga SOLO el extra)
-#
-#   Sábado:
-#     - No trabaja           → nada (ya pagado en base)
-#     - Trabaja antes de 12h → bonus 50% sobre val_minuto
-#     - Trabaja desde 12h    → bonus 100% sobre val_minuto
-#
-#   Domingo / Feriado:
-#     - No trabaja           → nada (ya pagado en base)
-#     - Trabaja              → bonus 100% sobre val_minuto
-#
-# Retorna:
-#   (total_min, atraso_min, ot_dia_min, ot_noche_min, bonus50_min, bonus100_min)
 # ==========================================
 def clasificar_minutos(marcaciones_dia, weekday, es_feriado=False):
     punches = sorted(marcaciones_dia)
@@ -237,32 +309,23 @@ def clasificar_minutos(marcaciones_dia, weekday, es_feriado=False):
     bonus100_min = 0
 
     if es_feriado or weekday == 6:
-        # Feriado o domingo: base ya pagada → solo bonus 100%
         bonus100_min = total_min
 
     elif weekday == 5:
-        # Sábado: base ya pagada → solo bonus según horario
         for (entrada, salida) in pairs:
             mediodia = entrada.replace(hour=12, minute=0, second=0, microsecond=0)
-            # Antes del mediodía → bonus 50%
             ov_e = min(salida, mediodia)
             if ov_e > entrada:
                 bonus50_min += int((ov_e - entrada).total_seconds() / 60)
-            # Desde el mediodía → bonus 100%
             ov_s = max(entrada, mediodia)
             if salida > ov_s:
                 bonus100_min += int((salida - ov_s).total_seconds() / 60)
 
     else:
-        # Lunes–Viernes: día hábil normal
         if total_min < MINUTOS_JORNADA:
             diff = MINUTOS_JORNADA - total_min
             atraso_min = 0 if diff < TOLERANCIA_MIN else diff
-
         elif total_min > MINUTOS_JORNADA:
-            # Horas extra: base ya cubierta en sal_prop, se paga solo el adicional
-            # OT diurna → +50% (total multiplier sobre val_minuto: 1.5)
-            # OT nocturna → +100% (total multiplier sobre val_minuto: 2.0)
             overtime = total_min - MINUTOS_JORNADA
             rem_ot   = overtime
             for (entrada, salida) in reversed(pairs):
@@ -281,16 +344,6 @@ def clasificar_minutos(marcaciones_dia, weekday, es_feriado=False):
 
 # ==========================================
 # CÁLCULO DE NÓMINA
-#
-# val_dia    = salario_base / 30
-# val_minuto = val_dia / 480
-#
-# sal_prop   = salario_base * dias_calendario / 30
-#   → Si el período es el mes completo (30 días), sal_prop = salario_base.
-#   → Sábados y domingos ya están incluidos.
-#
-# Descuentos solo aplican a días hábiles (lun-vie) con ausencia.
-# Bonuses aplican solo cuando el empleado efectivamente trabaja sáb/dom/feriado.
 # ==========================================
 def calcular_nomina(df_func, df_bio, fecha_inicio, fecha_fin,
                     periodo_tipo, feriados=None):
@@ -323,18 +376,14 @@ def calcular_nomina(df_func, df_bio, fecha_inicio, fecha_fin,
         ci           = emp["CI Nº"]
         cargo        = dict_cargos.get(nombre, "Funcionario")
 
-        # Valor de un día y de un minuto — divisor siempre 30
         val_dia    = salario_base / DIAS_MES
         val_minuto = val_dia / MINUTOS_JORNADA
 
-        # Salario proporcional al período
         if periodo_tipo == "Semanal":
-            # Semana = 7 días / 30
             sal_prop = round(salario_base * 7 / DIAS_MES)
         else:
             sal_prop = round(salario_base * dias_calendario / DIAS_MES)
 
-        # ── Marcaciones del empleado ──
         marcs_emp = df_bio_p[df_bio_p["Nomb."] == nombre]
 
         total_atraso        = 0
@@ -343,7 +392,7 @@ def calcular_nomina(df_func, df_bio, fecha_inicio, fecha_fin,
         total_bonus50       = 0
         total_bonus100      = 0
         feriados_trabajados = 0
-        dias_hab_trabajados = {}  # {fecha: True} — lun-vie no feriado
+        dias_hab_trabajados = {}
 
         if not marcs_emp.empty:
             for fecha in sorted(marcs_emp["Tiempo"].dt.date.unique()):
@@ -366,13 +415,9 @@ def calcular_nomina(df_func, df_bio, fecha_inicio, fecha_fin,
                 total_bonus50  += b50
                 total_bonus100 += b100
 
-                # Registrar presencia en días hábiles para control de ausencias
                 if wd < 5 and not es_feriado:
                     dias_hab_trabajados[fecha] = True
 
-        # ── Ausencias: solo se evalúan días hábiles (lun-vie, no feriado) ──
-        # La penalidad semanal se calcula según ley PY.
-        # El descuento usa val_dia (= salario / 30), coherente con el divisor.
         total_dias_ausentes  = 0
         total_dias_descuento = 0
 
@@ -385,12 +430,12 @@ def calcular_nomina(df_func, df_bio, fecha_inicio, fecha_fin,
             dias_esperados  = 0
             dias_trabajados = 0
 
-            for d in range(5):  # lun=0 … vie=4
+            for d in range(5):
                 dia = (semana_ini + pd.Timedelta(days=d)).date()
                 if dia < fecha_inicio or dia > fecha_fin:
                     continue
                 if dia in feriados_set:
-                    continue   # feriado = descanso pagado, no es ausencia
+                    continue
                 dias_esperados += 1
                 if dia in dias_hab_trabajados:
                     dias_trabajados += 1
@@ -402,21 +447,10 @@ def calcular_nomina(df_func, df_bio, fecha_inicio, fecha_fin,
             total_dias_descuento += dias_desc
             semana_ini += pd.Timedelta(days=7)
 
-        # ── Montos ──
         desc_ausencias = round(total_dias_descuento * val_dia)
         desc_atrasos   = round(total_atraso         * val_minuto)
-
-        # OT lun-vie: la base de esas horas YA está en sal_prop (÷30 cubre todo).
-        # Se paga el porcentaje adicional: diurna +50%, nocturna +100%.
-        # Como la base ya está pagada, el multiplicador es 0.5 y 1.0 respectivamente.
-        # Pero por convención contable paraguaya se expresa como 1.5 y 2.0 sobre
-        # val_minuto y se descuenta el val_minuto de base ya incluido:
-        # neto_diurna  = val_minuto × (1.5 - 1.0) = val_minuto × 0.5
-        # neto_nocturna = val_minuto × (2.0 - 1.0) = val_minuto × 1.0
         monto_ot_dia   = round(total_ot_dia   * val_minuto * 0.5)
         monto_ot_noche = round(total_ot_noche * val_minuto * 1.0)
-
-        # Bonus sáb/dom/feriado: base ya en sal_prop → solo el porcentaje bonus.
         monto_bonus50  = round(total_bonus50  * val_minuto * 0.5)
         monto_bonus100 = round(total_bonus100 * val_minuto * 1.0)
 
@@ -499,7 +533,6 @@ class PDFHolerite(FPDF):
         tipo_txt = ("COMPROVANTE EMPRESA" if es_empresa
                     else "COMPROVANTE FUNCIONARIO")
 
-        # Cabecera
         self.set_xy(L, 4 + oy)
         self.set_font("Helvetica", "B", 9)
         self.cell(RW / 2, 5, "Empresa", 0, 0, "L")
@@ -518,7 +551,6 @@ class PDFHolerite(FPDF):
         self.cell(RW / 4, 5, periodo_str, 0, 1, "C")
         self.line(L, 20 + oy, L + RW, 20 + oy)
 
-        # Datos empleado
         self.set_xy(L, 21 + oy)
         self.set_font("Helvetica", "B", 7)
         self.cell(RW * 0.55, 4, "Funcionário", 0, 0)
@@ -533,7 +565,6 @@ class PDFHolerite(FPDF):
                   str(data["Cargo"]).upper(), 0, 1)
         self.line(L, 31 + oy, L + RW, 31 + oy)
 
-        # Cabecera tabla
         self.set_xy(L, 32 + oy)
         self.set_font("Helvetica", "B", 7)
         self.cell(C_COD,   6, "Cód.",        1, 0, "C")
@@ -550,44 +581,34 @@ class PDFHolerite(FPDF):
             bg = (245, 245, 245) if alt else (255, 255, 255)
             self.set_fill_color(*bg)
             self.set_font("Helvetica", "", 7)
-            self.cell(C_COD,   ROW_H, str(cod),
-                      1, 0, "C", True)
-            self.cell(C_DESC,  ROW_H, f" {desc}",
-                      1, 0, "L", True)
-            self.cell(C_REF,   ROW_H, str(ref),
-                      1, 0, "C", True)
-            self.cell(C_REC,   ROW_H, format_gs(recibir),
-                      1, 0, "R", True)
-            self.cell(C_DESC2, ROW_H, format_gs(descuento),
-                      1, 1, "R", True)
+            self.cell(C_COD,   ROW_H, str(cod),         1, 0, "C", True)
+            self.cell(C_DESC,  ROW_H, f" {desc}",       1, 0, "L", True)
+            self.cell(C_REF,   ROW_H, str(ref),         1, 0, "C", True)
+            self.cell(C_REC,   ROW_H, format_gs(recibir),  1, 0, "R", True)
+            self.cell(C_DESC2, ROW_H, format_gs(descuento),1, 1, "R", True)
             alt = not alt
 
-        # Fila 1 — Salario base
         dias_cal = data.get("Días Calendario", 30)
         ref_base = ("7 días / 30" if data["Período"] == "Semanal"
                     else f"{dias_cal} días / 30")
         fila("1", "Salario Base (sáb/dom incluidos)",
              ref_base, data["Salario Proporcional"], 0)
 
-        # Fila 2 — OT diurna (+50% sobre val/min)
         if data.get("Monto OT Diurna", 0) > 0:
             hrs = data["OT Diurna (min)"] / 60
             fila("2", "Hora Extra Diurna (+50% s/valor minuto)",
                  f"{hrs:.1f} hrs", data["Monto OT Diurna"], 0)
 
-        # Fila 3 — OT nocturna (+100% sobre val/min)
         if data.get("Monto OT Nocturna", 0) > 0:
             hrs = data["OT Nocturna (min)"] / 60
             fila("3", "Hora Extra Nocturna (+100% s/valor minuto)",
                  f"{hrs:.1f} hrs", data["Monto OT Nocturna"], 0)
 
-        # Fila 4 — Bonus sábado mañana (+50%)
         if data.get("Monto Bonus Sáb Mañana", 0) > 0:
             hrs = data["Bonus Sáb Mañana (min)"] / 60
             fila("4", "Bonif. Sábado Mañana (+50% s/val. min)",
                  f"{hrs:.1f} hrs", data["Monto Bonus Sáb Mañana"], 0)
 
-        # Fila 5 — Bonus descanso/feriado (+100%)
         if data.get("Monto Bonus Descanso", 0) > 0:
             hrs = data["Bonus Descanso (min)"] / 60
             label = "Bonif. Sáb Tarde/Dom/Feriado (+100% s/val. min)"
@@ -596,28 +617,23 @@ class PDFHolerite(FPDF):
             fila("5", label, f"{hrs:.1f} hrs",
                  data["Monto Bonus Descanso"], 0)
 
-        # Fila 6 — Ausencias
         if data.get("Desc. Ausencias", 0) > 0:
             fila("6", "Faltas y Ausencias Injustificadas",
                  f"{data['Días a Descontar']} días desc.",
                  0, data["Desc. Ausencias"])
 
-        # Fila 7 — Atrasos
         if data.get("Desc. Atrasos", 0) > 0:
             fila("7", "Atrasos",
                  f"{data['Atrasos (min)']} mins",
                  0, data["Desc. Atrasos"])
 
-        # Fila 8 — IPS
         fila("8", "Descuento IPS", "9% s/ Imponible",
              0, data["IPS (9%)"])
 
-        # Relleno mínimo
         min_y = 95 + oy
         while self.get_y() < min_y:
             fila("", "", "", 0, 0)
 
-        # Total
         self.set_font("Helvetica", "B", 8)
         self.set_fill_color(220, 220, 220)
         self.cell(C_COD + C_DESC + C_REF, ROW_H,
@@ -625,7 +641,6 @@ class PDFHolerite(FPDF):
         self.cell(C_REC + C_DESC2, ROW_H,
                   format_gs(data["Salario Líquido"]), 1, 1, "R", True)
 
-        # Observación
         y_obs = self.get_y() + 3
         self.set_xy(L, y_obs)
         self.set_font("Helvetica", "B", 7)
@@ -634,22 +649,18 @@ class PDFHolerite(FPDF):
         self.cell(RW, 4, str(data["Funcionario"]).upper(), 0, 1)
         self.cell(RW, 4, f"CI: {data['CI Nº']}", 0, 1)
 
-        # Firmas
         y_f = self.get_y() + 5
         self.set_xy(L, y_f)
         self.set_font("Helvetica", "", 7)
         self.cell(40, 5, "FECHA: _____/_____/_______", 0, 0)
         self.cell(5,  5, "", 0, 0)
-        self.cell(65, 5,
-                  "FIRMA EMPRESA: _______________________", 0, 0)
+        self.cell(65, 5, "FIRMA EMPRESA: _______________________", 0, 0)
         self.cell(5,  5, "", 0, 0)
-        self.cell(60, 5,
-                  "FIRMA FUNC.: ________________________", 0, 1)
+        self.cell(60, 5, "FIRMA FUNC.: ________________________", 0, 1)
 
     def generar(self, data: dict):
         self.add_page()
         self._half(data, es_empresa=True, oy=0)
-        # Línea de corte
         self.set_draw_color(160, 160, 160)
         self.set_line_width(0.15)
         x = 8
@@ -707,7 +718,6 @@ def calendario_feriados(fecha_inicio: datetime.date,
     yr  = st.session_state[f"{key_prefix}_year"]
     mo  = st.session_state[f"{key_prefix}_month"]
 
-    # Navegación
     nav1, nav2, nav3 = st.columns([1, 3, 1])
     with nav1:
         if st.button("◀", key=f"{key_prefix}_prev"):
@@ -735,7 +745,6 @@ def calendario_feriados(fecha_inicio: datetime.date,
                 st.session_state[f"{key_prefix}_month"] = mo + 1
             st.rerun()
 
-    # Cabecera días
     dias_semana = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
     header_cols = st.columns(7)
     for i, d in enumerate(dias_semana):
@@ -746,7 +755,6 @@ def calendario_feriados(fecha_inicio: datetime.date,
             unsafe_allow_html=True
         )
 
-    # Grilla
     for semana in calendar.monthcalendar(yr, mo):
         row_cols = st.columns(7)
         for i, dia_num in enumerate(semana):
@@ -884,8 +892,7 @@ with tab_lista:
             st.session_state["cal_selected"].add(f)
         st.rerun()
 
-# Fuente única de verdad
-feriados_lista     = sorted(st.session_state.get("cal_selected", set()))
+feriados_lista      = sorted(st.session_state.get("cal_selected", set()))
 feriados_en_periodo = [f for f in feriados_lista
                         if fecha_inicio <= f <= fecha_fin]
 
@@ -906,7 +913,6 @@ if feriados_lista:
 else:
     st.info("No hay feriados marcados aún.")
 
-# Resumen del período
 dias_cal_prev = (fecha_fin - fecha_inicio).days + 1
 dias_hab_prev = calcular_dias_habiles(
     fecha_inicio, fecha_fin, feriados_en_periodo)
@@ -919,7 +925,6 @@ st.success(
     f"Tipo: **{periodo_tipo}**"
 )
 
-# Ejemplo numérico para verificación rápida
 with st.expander("🔢 Verificar lógica de cálculo con ejemplo"):
     sal_ej = st.number_input(
         "Salario base de ejemplo (Gs.)",
@@ -943,32 +948,45 @@ with st.expander("🔢 Verificar lógica de cálculo con ejemplo"):
         )
 
 st.write("---")
+
+# ==========================================
+# PROCESAMIENTO
+# ==========================================
 if pdf_func and pdf_bio:
     if st.button("⚙️  Procesar y Calcular Nómina",
                  type="primary", use_container_width=True):
         with st.spinner("Procesando documentos..."):
             try:
-                text1 = extract_text_from_pdf(pdf_func)
-                text2 = extract_text_from_pdf(pdf_bio)
-                df_f1 = parse_funcionarios(text1)
-                df_f2 = parse_funcionarios(text2)
-                if not df_f1.empty:
+                text_func = extract_text_from_pdf(pdf_func)
+                text_bio  = extract_text_from_pdf(pdf_bio)
+
+                # Intentar parsear funcionarios en ambos archivos;
+                # quedarse con el que tenga más registros
+                df_f1 = parse_funcionarios(text_func)
+                df_f2 = parse_funcionarios(text_bio)
+
+                if len(df_f1) >= len(df_f2) and not df_f1.empty:
                     df_func_data = df_f1
-                    text_bio     = text2
+                    text_bio_use = text_bio
                 elif not df_f2.empty:
                     df_func_data = df_f2
-                    text_bio     = text1
+                    text_bio_use = text_func
                 else:
-                    st.error("No se pudieron extraer datos de empleados.")
+                    st.error("No se pudieron extraer datos de empleados. "
+                             "Revisá que el PDF de Funcionarios tenga el "
+                             "formato correcto (ID / Nombre / CI / Gs.X).")
                     st.stop()
 
                 with st.expander("🔍 Funcionarios detectados"):
                     st.dataframe(df_func_data, use_container_width=True)
 
-                df_bio_data = parse_biometrico(text_bio, df_func_data)
+                df_bio_data = parse_biometrico(text_bio_use, df_func_data)
+
                 if df_bio_data.empty:
                     st.error(
-                        "No se detectaron marcaciones válidas en el Book.")
+                        "No se detectaron marcaciones válidas en el Book. "
+                        "Verificá que el PDF biométrico tenga el formato "
+                        "'ID nombre / departamento / DD/MM/YYYY HH:MM:SS'.")
                     st.stop()
 
                 with st.expander("🔍 Marcaciones biométricas (primeras 60)"):
@@ -981,8 +999,9 @@ if pdf_func and pdf_bio:
                     periodo_tipo,
                     feriados=feriados_en_periodo,
                 )
+
                 if df_res.empty:
-                    st.error("No se generaron resultados.")
+                    st.error("No se generaron resultados de nómina.")
                     st.stop()
 
                 st.session_state["resultados"]      = df_res
@@ -991,6 +1010,7 @@ if pdf_func and pdf_bio:
                     f"✅ Cálculo completado — {len(df_res)} funcionarios — "
                     f"{len(feriados_en_periodo)} feriado(s) aplicado(s)."
                 )
+
             except Exception as e:
                 st.error(f"Error durante el procesamiento: {e}")
                 st.exception(e)
