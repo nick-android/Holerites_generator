@@ -25,8 +25,8 @@ st.markdown(
 # ==========================================
 # CONSTANTES LABORALES
 # ==========================================
-MINUTOS_JORNADA = 8 * 60   # 480 min
-DIAS_MES        = 30       # divisor fijo: todos los días del mes están pagados
+MINUTOS_JORNADA = 8 * 60
+DIAS_MES        = 30
 TASA_IPS        = 0.09
 TOLERANCIA_MIN  = 5
 
@@ -52,13 +52,14 @@ def calcular_dias_habiles(fecha_inicio, fecha_fin, feriados=None):
 
 
 # ==========================================
-# EXTRACCIÓN DE TEXTO — celda por celda
+# EXTRACCIÓN DE TEXTO
 # ==========================================
 def extract_text_from_pdf(pdf_file):
     """
-    Extrae el contenido del PDF celda por celda cuando hay tablas,
-    o línea por línea cuando es texto plano. Siempre devuelve un
-    string con un token por línea, que es lo que esperan los parsers.
+    Devuelve el texto del PDF como string con una línea por token.
+    Primero intenta extraer tablas (celda a celda); si la página no
+    tiene tablas detectadas, extrae texto plano línea a línea.
+    Ambas rutas producen el mismo contrato: un token por línea.
     """
     lines = []
     with pdfplumber.open(pdf_file) as pdf:
@@ -84,7 +85,7 @@ def extract_text_from_pdf(pdf_file):
 # ==========================================
 # PARSER — FUNCIONARIOS Y SUELDOS
 #
-# Formato real del PDF (una celda por línea tras extract_text_from_pdf):
+# Formato real (una línea por celda / token):
 #   ID.
 #   Nome
 #   C.I.
@@ -92,11 +93,14 @@ def extract_text_from_pdf(pdf_file):
 #   111
 #   Ignacio Venialgo Figueredo
 #   5083111
-#   Gs.7.000.000
+#   Gs.7.000.000        ← ancla de búsqueda
+#   270
+#   Roberto Venialgo Figueredo
 #   ...
 #
-# Estrategia: buscar patrón "Gs.X.XXX.XXX", luego mirar
-# las 3 líneas anteriores → [ID, Nombre, CI]
+# Estrategia: encontrar línea con patrón Gs.X.XXX.XXX,
+# luego mirar hacia atrás ignorando headers para obtener
+# [CI (opcional), Nombre, ID].
 # ==========================================
 def parse_funcionarios(text):
     lines = [l.strip() for l in text.split("\n") if l.strip()]
@@ -104,31 +108,35 @@ def parse_funcionarios(text):
     HEADERS = {
         "id.", "nome", "c.i.", "salarios", "id", "nombre", "ci",
         "nombre y apellido", "funcionarios y sueldos",
-        "funcionários y sueldos", "salario"
+        "funcionários y sueldos", "salario", "depart.",
+        "tiempo", "id del dispositivo"
     }
 
-    # Patrón Gs.7.000.000 o Gs. 7.000.000
-    salary_pat = re.compile(r"^Gs\.?\s*([\d.]+)$", re.IGNORECASE)
+    # Acepta: Gs.7.000.000  |  Gs. 7.000.000  |  gs.7.000.000
+    salary_pat = re.compile(r"^[Gg][Ss]\.?\s*([\d.]+)$")
     int_pat    = re.compile(r"^\d+$")
 
     funcionarios = []
-    seen_ids = set()
+    seen_ids     = set()
 
-    for i, line in enumerate(lines):
+    for idx, line in enumerate(lines):
         m = salary_pat.match(line)
         if not m:
             continue
 
-        salary_str = m.group(1).replace(".", "")
+        raw = m.group(1).replace(".", "")
         try:
-            salary = float(salary_str)
+            salary = float(raw)
         except ValueError:
             continue
+        # Descartar valores absurdos (ej. una CI interpretada como salario)
+        if salary < 100_000:
+            continue
 
-        # Recolectar hasta 5 líneas anteriores ignorando headers
+        # Recolectar hasta 6 líneas anteriores, saltar headers
         preceding = []
-        j = i - 1
-        while j >= 0 and len(preceding) < 5:
+        j = idx - 1
+        while j >= 0 and len(preceding) < 6:
             c = lines[j].strip()
             if c and c.lower() not in HEADERS:
                 preceding.insert(0, c)
@@ -137,15 +145,10 @@ def parse_funcionarios(text):
         if not preceding:
             continue
 
-        # El orden esperado hacia atrás desde el salario es:
-        #   CI  ←  Nombre  ←  ID
-        # pero CI puede faltar (ej. Ricardo Perelló no tiene CI)
+        emp_id = None
+        ci     = ""
 
-        emp_id    = None
-        ci        = ""
-        nombre    = ""
-
-        # ¿El último token es una CI (número > 5 dígitos)?
+        # ¿El último token es una CI (número largo, > 5 dígitos)?
         if int_pat.match(preceding[-1]) and len(preceding[-1]) > 5:
             ci        = preceding[-1]
             remaining = preceding[:-1]
@@ -155,12 +158,12 @@ def parse_funcionarios(text):
         if not remaining:
             continue
 
-        # Recorrer de derecha a izquierda buscando el ID (número pequeño)
+        # Recorrer de derecha a izquierda buscando el ID (número ≤ 5 dígitos)
         name_parts = []
         for k in range(len(remaining) - 1, -1, -1):
             tok = remaining[k]
-            if int_pat.match(tok) and int(tok) < 100000:
-                emp_id = int(tok)
+            if int_pat.match(tok) and int(tok) < 100_000:
+                emp_id     = int(tok)
                 name_parts = remaining[k + 1:]
                 break
             else:
@@ -171,9 +174,9 @@ def parse_funcionarios(text):
         if emp_id is not None and nombre and emp_id not in seen_ids:
             seen_ids.add(emp_id)
             funcionarios.append({
-                "ID":                emp_id,
-                "NOMBRE Y APELLIDO": nombre,
-                "CI Nº":             ci,
+                "ID":                 emp_id,
+                "NOMBRE Y APELLIDO":  nombre,
+                "CI Nº":              ci,
                 "SALARIO REAJUSTADO": salary,
             })
 
@@ -183,27 +186,24 @@ def parse_funcionarios(text):
 # ==========================================
 # PARSER — BOOK (BIOMÉTRICO)
 #
-# Formato real del PDF (una celda por línea):
-#   26 luis alberto
-#   montador steel
-#   01/06/2026 07:05:00
-#   1
+# Formato real (una línea por celda):
+#   26 luis alberto       ← "ID nombre_parcial"
+#   montador steel        ← departamento
+#   01/06/2026 07:05:00   ← timestamp  ← ANCLA
+#   1                     ← ID dispositivo (se ignora)
 #   270 roberto venialgo
 #   montador steel
 #   01/06/2026 07:22:48
 #   1
 #   ...
 #
-# Estrategia: buscar líneas con timestamp "DD/MM/YYYY HH:MM:SS",
-# luego mirar i-1 → departamento, i-2 → "ID nombre".
-# El ID se cruza contra el dict de funcionarios para obtener
-# el nombre completo.
+# Estrategia: encontrar líneas con timestamp; i-1 = depto, i-2 = "ID nombre".
+# El ID se cruza con el dict de funcionarios para obtener nombre completo.
 # ==========================================
 def parse_biometrico(text, df_funcionarios):
     if df_funcionarios is None or df_funcionarios.empty:
         return pd.DataFrame()
 
-    # Mapa ID → nombre completo (desde la planilla de sueldos)
     id_to_nombre = dict(zip(
         df_funcionarios["ID"],
         df_funcionarios["NOMBRE Y APELLIDO"]
@@ -211,16 +211,15 @@ def parse_biometrico(text, df_funcionarios):
 
     lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-    # Headers a ignorar (aparecen al inicio de cada página)
     SKIP_H = {
         "id.", "nombre", "depart.", "tiempo", "id del dispositivo",
         "book", "reporte", "fecha", "hora", "1", "id",
-        "departamento", "depart"
+        "departamento", "depart", "nome", "c.i.", "salarios",
+        "salario", "funcionarios y sueldos", "funcionários y sueldos"
     }
     clean = [l for l in lines if l.lower() not in SKIP_H]
 
     ts_pat      = re.compile(r"^\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}$")
-    # "26 luis alberto" — ID seguido de nombre parcial
     id_name_pat = re.compile(r"^(\d+)\s+(.+)$")
 
     marcaciones = []
@@ -236,11 +235,10 @@ def parse_biometrico(text, df_funcionarios):
         dept_line = clean[i - 1].lower() if i >= 1 else ""
         name_line = clean[i - 2]         if i >= 2 else ""
 
-        # Determinar cargo según departamento
-        if   "drywall"      in dept_line: cargo = "Montador DryWall"
-        elif "steel"        in dept_line: cargo = "Montador Steel Frame"
-        elif "admin"        in dept_line: cargo = "Administrativo"
-        else:                             cargo = "Funcionario"
+        if   "drywall" in dept_line: cargo = "Montador DryWall"
+        elif "steel"   in dept_line: cargo = "Montador Steel Frame"
+        elif "admin"   in dept_line: cargo = "Administrativo"
+        else:                        cargo = "Funcionario"
 
         m = id_name_pat.match(name_line)
         if not m:
@@ -261,7 +259,7 @@ def parse_biometrico(text, df_funcionarios):
 
 
 # ==========================================
-# HELPER — MINUTOS NOCTURNOS
+# HELPER — MINUTOS NOCTURNOS (22:00–06:00)
 # ==========================================
 def _minutos_nocturnos(entrada: pd.Timestamp, salida: pd.Timestamp) -> int:
     if salida <= entrada:
@@ -313,7 +311,8 @@ def clasificar_minutos(marcaciones_dia, weekday, es_feriado=False):
 
     elif weekday == 5:
         for (entrada, salida) in pairs:
-            mediodia = entrada.replace(hour=12, minute=0, second=0, microsecond=0)
+            mediodia = entrada.replace(hour=12, minute=0,
+                                       second=0, microsecond=0)
             ov_e = min(salida, mediodia)
             if ov_e > entrada:
                 bonus50_min += int((ov_e - entrada).total_seconds() / 60)
@@ -581,9 +580,9 @@ class PDFHolerite(FPDF):
             bg = (245, 245, 245) if alt else (255, 255, 255)
             self.set_fill_color(*bg)
             self.set_font("Helvetica", "", 7)
-            self.cell(C_COD,   ROW_H, str(cod),         1, 0, "C", True)
-            self.cell(C_DESC,  ROW_H, f" {desc}",       1, 0, "L", True)
-            self.cell(C_REF,   ROW_H, str(ref),         1, 0, "C", True)
+            self.cell(C_COD,   ROW_H, str(cod),            1, 0, "C", True)
+            self.cell(C_DESC,  ROW_H, f" {desc}",          1, 0, "L", True)
+            self.cell(C_REF,   ROW_H, str(ref),            1, 0, "C", True)
             self.cell(C_REC,   ROW_H, format_gs(recibir),  1, 0, "R", True)
             self.cell(C_DESC2, ROW_H, format_gs(descuento),1, 1, "R", True)
             alt = not alt
@@ -960,11 +959,16 @@ if pdf_func and pdf_bio:
                 text_func = extract_text_from_pdf(pdf_func)
                 text_bio  = extract_text_from_pdf(pdf_bio)
 
-                # Intentar parsear funcionarios en ambos archivos;
-                # quedarse con el que tenga más registros
+                # ── Diagnóstico opcional (descomentar si hay problemas) ──
+                # with st.expander("🛠 Texto extraído — Funcionarios (raw)"):
+                #     st.text(text_func[:3000])
+                # with st.expander("🛠 Texto extraído — Book (raw)"):
+                #     st.text(text_bio[:3000])
+
                 df_f1 = parse_funcionarios(text_func)
                 df_f2 = parse_funcionarios(text_bio)
 
+                # Quedarse con el archivo que tenga más funcionarios
                 if len(df_f1) >= len(df_f2) and not df_f1.empty:
                     df_func_data = df_f1
                     text_bio_use = text_bio
@@ -972,9 +976,10 @@ if pdf_func and pdf_bio:
                     df_func_data = df_f2
                     text_bio_use = text_func
                 else:
-                    st.error("No se pudieron extraer datos de empleados. "
-                             "Revisá que el PDF de Funcionarios tenga el "
-                             "formato correcto (ID / Nombre / CI / Gs.X).")
+                    st.error(
+                        "No se pudieron extraer datos de empleados. "
+                        "Asegurate de que el PDF de Funcionarios contenga "
+                        "las columnas ID / Nombre / CI / Gs.X.XXX.XXX.")
                     st.stop()
 
                 with st.expander("🔍 Funcionarios detectados"):
@@ -985,8 +990,9 @@ if pdf_func and pdf_bio:
                 if df_bio_data.empty:
                     st.error(
                         "No se detectaron marcaciones válidas en el Book. "
-                        "Verificá que el PDF biométrico tenga el formato "
-                        "'ID nombre / departamento / DD/MM/YYYY HH:MM:SS'.")
+                        "Verificá que el PDF biométrico tenga filas con "
+                        "el formato: 'ID nombre / departamento / "
+                        "DD/MM/YYYY HH:MM:SS'.")
                     st.stop()
 
                 with st.expander("🔍 Marcaciones biométricas (primeras 60)"):
