@@ -52,40 +52,33 @@ def calcular_dias_habiles(fecha_inicio, fecha_fin, feriados=None):
 
 
 # ==========================================
-# EXTRACCIÓN DE TEXTO
+# EXTRACCIÓN DE TEXTO — solo texto plano
 # ==========================================
 def extract_text_from_pdf(pdf_file):
     """
-    Devuelve el texto del PDF como string con una línea por token.
-    Primero intenta extraer tablas (celda a celda); si la página no
-    tiene tablas detectadas, extrae texto plano línea a línea.
-    Ambas rutas producen el mismo contrato: un token por línea.
+    Lee cada página con extract_text() y devuelve un string
+    con una línea por token. NO usa extract_tables() porque
+    estos PDFs son texto plano y pdfplumber los lee bien línea
+    a línea de esa forma.
     """
     lines = []
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
-            tables = page.extract_tables()
-            if tables:
-                for table in tables:
-                    for row in table:
-                        for cell in row:
-                            val = str(cell).strip() if cell is not None else ""
-                            if val and val.lower() != "none":
-                                lines.append(val)
-            else:
-                t = page.extract_text()
-                if t:
-                    for line in t.split("\n"):
-                        line = line.strip()
-                        if line:
-                            lines.append(line)
+            t = page.extract_text()
+            if not t:
+                continue
+            for line in t.split("\n"):
+                line = line.strip()
+                if line:
+                    lines.append(line)
     return "\n".join(lines)
 
 
 # ==========================================
 # PARSER — FUNCIONARIOS Y SUELDOS
 #
-# Formato real (una línea por celda / token):
+# Formato real (una línea por fila del PDF):
+#
 #   ID.
 #   Nome
 #   C.I.
@@ -93,14 +86,19 @@ def extract_text_from_pdf(pdf_file):
 #   111
 #   Ignacio Venialgo Figueredo
 #   5083111
-#   Gs.7.000.000        ← ancla de búsqueda
+#   Gs.7.000.000          ← ancla
 #   270
 #   Roberto Venialgo Figueredo
+#   4125270
+#   Gs.6.600.000          ← ancla
 #   ...
+#   105
+#   Ricardo Perelló       ← sin CI
+#   Gs.11.000.000         ← ancla
 #
-# Estrategia: encontrar línea con patrón Gs.X.XXX.XXX,
-# luego mirar hacia atrás ignorando headers para obtener
-# [CI (opcional), Nombre, ID].
+# Estrategia: encontrar ancla Gs.X, luego mirar las líneas
+# previas (ignorando headers) para obtener CI (opcional),
+# nombre y ID.
 # ==========================================
 def parse_funcionarios(text):
     lines = [l.strip() for l in text.split("\n") if l.strip()]
@@ -109,10 +107,10 @@ def parse_funcionarios(text):
         "id.", "nome", "c.i.", "salarios", "id", "nombre", "ci",
         "nombre y apellido", "funcionarios y sueldos",
         "funcionários y sueldos", "salario", "depart.",
-        "tiempo", "id del dispositivo"
+        "tiempo", "id del dispositivo", "id del dispositivo"
     }
 
-    # Acepta: Gs.7.000.000  |  Gs. 7.000.000  |  gs.7.000.000
+    # Gs.7.000.000  o  Gs. 7.000.000  (con o sin espacio, mayúsculas/min)
     salary_pat = re.compile(r"^[Gg][Ss]\.?\s*([\d.]+)$")
     int_pat    = re.compile(r"^\d+$")
 
@@ -129,11 +127,10 @@ def parse_funcionarios(text):
             salary = float(raw)
         except ValueError:
             continue
-        # Descartar valores absurdos (ej. una CI interpretada como salario)
-        if salary < 100_000:
+        if salary < 500_000:          # descarta CIs o números pequeños
             continue
 
-        # Recolectar hasta 6 líneas anteriores, saltar headers
+        # Recolectar hasta 6 líneas previas, saltando headers
         preceding = []
         j = idx - 1
         while j >= 0 and len(preceding) < 6:
@@ -148,9 +145,13 @@ def parse_funcionarios(text):
         emp_id = None
         ci     = ""
 
-        # ¿El último token es una CI (número largo, > 5 dígitos)?
-        if int_pat.match(preceding[-1]) and len(preceding[-1]) > 5:
-            ci        = preceding[-1]
+        # ¿El último token antes del salario es una CI?
+        # CI = solo dígitos, longitud > 5 y < 12
+        last = preceding[-1]
+        if (int_pat.match(last)
+                and 5 < len(last) <= 12
+                and int(last) >= 100_000):
+            ci        = last
             remaining = preceding[:-1]
         else:
             remaining = preceding[:]
@@ -158,20 +159,27 @@ def parse_funcionarios(text):
         if not remaining:
             continue
 
-        # Recorrer de derecha a izquierda buscando el ID (número ≤ 5 dígitos)
+        # Buscar el ID (número pequeño ≤ 5 dígitos) de derecha a izquierda
         name_parts = []
+        found_id   = False
         for k in range(len(remaining) - 1, -1, -1):
             tok = remaining[k]
-            if int_pat.match(tok) and int(tok) < 100_000:
+            if int_pat.match(tok) and int(tok) < 100_000 and len(tok) <= 5:
                 emp_id     = int(tok)
                 name_parts = remaining[k + 1:]
+                found_id   = True
                 break
             else:
                 name_parts.insert(0, tok)
 
-        nombre = " ".join(name_parts).strip()
+        if not found_id:
+            continue
 
-        if emp_id is not None and nombre and emp_id not in seen_ids:
+        nombre = " ".join(name_parts).strip()
+        if not nombre:
+            continue
+
+        if emp_id not in seen_ids:
             seen_ids.add(emp_id)
             funcionarios.append({
                 "ID":                 emp_id,
@@ -186,19 +194,24 @@ def parse_funcionarios(text):
 # ==========================================
 # PARSER — BOOK (BIOMÉTRICO)
 #
-# Formato real (una línea por celda):
+# Formato real (una línea por fila):
+#
+#   ID.
+#   Nombre
+#   Depart.
+#   Tiempo
+#   ID del dispositivo
 #   26 luis alberto       ← "ID nombre_parcial"
 #   montador steel        ← departamento
 #   01/06/2026 07:05:00   ← timestamp  ← ANCLA
-#   1                     ← ID dispositivo (se ignora)
+#   1                     ← ID dispositivo
 #   270 roberto venialgo
 #   montador steel
 #   01/06/2026 07:22:48
 #   1
 #   ...
 #
-# Estrategia: encontrar líneas con timestamp; i-1 = depto, i-2 = "ID nombre".
-# El ID se cruza con el dict de funcionarios para obtener nombre completo.
+# Estrategia: encontrar timestamp; i-1 = depto, i-2 = "ID nombre".
 # ==========================================
 def parse_biometrico(text, df_funcionarios):
     if df_funcionarios is None or df_funcionarios.empty:
@@ -214,8 +227,8 @@ def parse_biometrico(text, df_funcionarios):
     SKIP_H = {
         "id.", "nombre", "depart.", "tiempo", "id del dispositivo",
         "book", "reporte", "fecha", "hora", "1", "id",
-        "departamento", "depart", "nome", "c.i.", "salarios",
-        "salario", "funcionarios y sueldos", "funcionários y sueldos"
+        "departamento", "nome", "c.i.", "salarios", "salario",
+        "funcionarios y sueldos", "funcionários y sueldos"
     }
     clean = [l for l in lines if l.lower() not in SKIP_H]
 
@@ -959,17 +972,16 @@ if pdf_func and pdf_bio:
                 text_func = extract_text_from_pdf(pdf_func)
                 text_bio  = extract_text_from_pdf(pdf_bio)
 
-                # ── Diagnóstico opcional (descomentar si hay problemas) ──
-                # with st.expander("🛠 Texto extraído — Funcionarios (raw)"):
+                # Diagnóstico — descomentar si hay problemas:
+                # with st.expander("🛠 RAW funcionarios"):
                 #     st.text(text_func[:3000])
-                # with st.expander("🛠 Texto extraído — Book (raw)"):
+                # with st.expander("🛠 RAW book"):
                 #     st.text(text_bio[:3000])
 
                 df_f1 = parse_funcionarios(text_func)
                 df_f2 = parse_funcionarios(text_bio)
 
-                # Quedarse con el archivo que tenga más funcionarios
-                if len(df_f1) >= len(df_f2) and not df_f1.empty:
+                if not df_f1.empty and len(df_f1) >= len(df_f2):
                     df_func_data = df_f1
                     text_bio_use = text_bio
                 elif not df_f2.empty:
@@ -978,8 +990,8 @@ if pdf_func and pdf_bio:
                 else:
                     st.error(
                         "No se pudieron extraer datos de empleados. "
-                        "Asegurate de que el PDF de Funcionarios contenga "
-                        "las columnas ID / Nombre / CI / Gs.X.XXX.XXX.")
+                        "Descomentá las líneas de diagnóstico para ver "
+                        "el texto raw extraído del PDF.")
                     st.stop()
 
                 with st.expander("🔍 Funcionarios detectados"):
@@ -989,10 +1001,7 @@ if pdf_func and pdf_bio:
 
                 if df_bio_data.empty:
                     st.error(
-                        "No se detectaron marcaciones válidas en el Book. "
-                        "Verificá que el PDF biométrico tenga filas con "
-                        "el formato: 'ID nombre / departamento / "
-                        "DD/MM/YYYY HH:MM:SS'.")
+                        "No se detectaron marcaciones válidas en el Book.")
                     st.stop()
 
                 with st.expander("🔍 Marcaciones biométricas (primeras 60)"):
